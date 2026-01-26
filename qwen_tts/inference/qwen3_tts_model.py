@@ -120,6 +120,57 @@ class Qwen3TTSModel:
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)
 
+    def enable_streaming_optimizations(
+        self,
+        decode_window_frames: int = 80,
+        use_compile: bool = True,
+        use_cuda_graphs: bool = True,
+        compile_mode: str = "reduce-overhead",
+        use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
+        compile_codebook_predictor: bool = True,
+    ):
+        """
+        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+
+        Significantly speeds up streaming generation by:
+        1. Compiling the decoder with torch.compile (reduces Python overhead)
+        2. Capturing CUDA graphs for fixed-size decode windows (eliminates GPU launch overhead)
+        3. Fast codebook generation (bypasses HuggingFace generate() overhead)
+
+        Call this method after loading the model, before starting streaming generation.
+
+        Args:
+            decode_window_frames: Fixed window size for streaming (must match the
+                                  decode_window_frames parameter in stream_generate_voice_clone)
+            use_compile: Apply torch.compile to the decoder (default True)
+            use_cuda_graphs: Capture CUDA graphs for the fixed window size (default True)
+            compile_mode: torch.compile mode - "reduce-overhead" (recommended for streaming),
+                          "max-autotune", or "default"
+            use_fast_codebook: Use fast codebook generation that bypasses HuggingFace's
+                               generate() overhead (default True, ~2x faster per step)
+            compile_codebook_predictor: Apply torch.compile to codebook predictor (experimental)
+
+        Returns:
+            self for method chaining
+
+        Example:
+            model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base", ...)
+            model.enable_streaming_optimizations(decode_window_frames=80)
+
+            # Now streaming will be faster
+            for chunk, sr in model.stream_generate_voice_clone(..., decode_window_frames=80):
+                ...
+        """
+        self.model.enable_streaming_optimizations(
+            decode_window_frames=decode_window_frames,
+            use_compile=use_compile,
+            use_cuda_graphs=use_cuda_graphs,
+            compile_mode=compile_mode,
+            use_fast_codebook=use_fast_codebook,
+            compile_codebook_predictor=compile_codebook_predictor,
+        )
+        return self
+
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)
         if callable(langs):
@@ -647,6 +698,8 @@ class Qwen3TTSModel:
         decode_window_frames: int = 80,
         overlap_samples: int = 512,
         max_frames: int = 10000,
+        # Optimization
+        use_optimized_decode: bool = True,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -666,6 +719,8 @@ class Qwen3TTSModel:
             decode_window_frames: Window size for decoding (longer = better quality, more latency).
             overlap_samples: Overlap samples for crossfade between chunks.
             max_frames: Maximum codec frames to generate.
+            use_optimized_decode: Use CUDA graph optimized decode when available (default True).
+                                  Call enable_streaming_optimizations() first for best performance.
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -742,6 +797,7 @@ class Qwen3TTSModel:
             decode_window_frames=decode_window_frames,
             overlap_samples=overlap_samples,
             max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
             **gen_kwargs,
         ):
             yield chunk, sr

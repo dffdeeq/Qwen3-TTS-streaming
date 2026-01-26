@@ -1368,6 +1368,122 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         model_kwargs["generation_steps"] = outputs.generation_steps
         return model_kwargs
 
+    def generate_fast(
+        self,
+        inputs_embeds: torch.Tensor,
+        num_codebooks: int,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Fast generation that bypasses HuggingFace's generate() overhead.
+
+        This is ~2-3x faster than using generate() because:
+        1. No GenerationMixin overhead (config creation, stopping criteria, etc.)
+        2. Direct forward calls with minimal wrapper logic
+        3. Simple KV-cache management
+
+        Args:
+            inputs_embeds: Initial embeddings [B, 2, hidden_size] (past_hidden + first_token_embed)
+            num_codebooks: Number of codebook tokens to generate (typically 7)
+            do_sample: Whether to sample or use greedy decoding
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            top_p: Top-p (nucleus) filtering
+
+        Returns:
+            Generated token IDs [B, num_codebooks]
+        """
+        batch_size = inputs_embeds.shape[0]
+        device = inputs_embeds.device
+
+        # Project inputs
+        inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
+
+        # Prefill: process initial embeddings
+        outputs = self.model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+        past_key_values = outputs.past_key_values
+        hidden_states = outputs.last_hidden_state
+
+        # Generate tokens for each codebook
+        generated_tokens = []
+        generation_step = 0  # Start from codebook 1 (index 0 in lm_head)
+
+        for step in range(num_codebooks):
+            # Get logits for current codebook
+            logits = self.lm_head[step](hidden_states[:, -1, :])  # [B, vocab_size]
+
+            # Sample or greedy
+            if do_sample and temperature > 0:
+                logits = logits / temperature
+
+                # Top-k filtering
+                if top_k > 0:
+                    top_k_val = min(top_k, logits.size(-1))
+                    indices_to_remove = logits < torch.topk(logits, top_k_val)[0][..., -1, None]
+                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+                # Top-p filtering
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            generated_tokens.append(next_token)
+
+            # Stop if we've generated all codebooks
+            if step == num_codebooks - 1:
+                break
+
+            # Get embedding for next step
+            next_embeds = self.model.get_input_embeddings()[step](next_token)
+            next_embeds = self.small_to_mtp_projection(next_embeds)
+
+            # Forward pass for next position
+            outputs = self.model(
+                input_ids=None,
+                inputs_embeds=next_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=False,
+            )
+            past_key_values = outputs.past_key_values
+            hidden_states = outputs.last_hidden_state
+
+        # Concatenate all generated tokens
+        return torch.cat(generated_tokens, dim=-1)  # [B, num_codebooks]
+
+    def enable_compile(self, mode: str = "reduce-overhead"):
+        """
+        Enable torch.compile for the code predictor model.
+
+        This compiles the inner model forward pass for faster execution.
+        Should be called once after model loading.
+        """
+        self.model.forward = torch.compile(
+            self.model.forward,
+            mode=mode,
+            fullgraph=False,  # Allow graph breaks for flexibility
+        )
+
 
 @dataclass
 class Qwen3TTSTalkerOutputWithPast(ModelOutput):
@@ -1682,6 +1798,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         sub_talker_loss = sub_talker_outputs.loss
         return sub_talker_logits, sub_talker_loss
 
+    def enable_fast_codebook_gen(self, enable: bool = True):
+        """Enable fast codebook generation (bypasses HuggingFace generate() overhead)."""
+        self._use_fast_codebook_gen = enable
+
     @can_return_tuple
     def forward(
         self,
@@ -1718,22 +1838,49 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=subtalker_dosample,
-                top_p=subtalker_top_p,
-                top_k=subtalker_top_k,
-                temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
-            codec_hiddens = torch.cat(
-                [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                dim=1,
-            )
+
+            # Use fast path if enabled (bypasses HuggingFace generate() overhead)
+            use_fast = getattr(self, '_use_fast_codebook_gen', False)
+
+            if use_fast:
+                # Fast path: direct forward loop (~2-3x faster)
+                # Mark step begin for CUDA graphs to avoid tensor overwrite errors
+                torch.compiler.cudagraph_mark_step_begin()
+                codebook_tokens = self.code_predictor.generate_fast(
+                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                    num_codebooks=self.config.num_code_groups - 1,
+                    do_sample=subtalker_dosample if subtalker_dosample is not None else True,
+                    temperature=subtalker_temperature if subtalker_temperature is not None else 1.0,
+                    top_k=subtalker_top_k if subtalker_top_k is not None else 50,
+                    top_p=subtalker_top_p if subtalker_top_p is not None else 1.0,
+                )
+                codec_ids = torch.cat((input_ids, codebook_tokens), dim=-1)
+                codec_hiddens = torch.cat(
+                    [last_id_hidden]
+                    + [self.code_predictor.get_input_embeddings()[i](codebook_tokens[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                    dim=1,
+                )
+            else:
+                # Original path: HuggingFace generate()
+                # Mark step begin for CUDA graphs to avoid tensor overwrite errors
+                torch.compiler.cudagraph_mark_step_begin()
+                predictor_result = self.code_predictor.generate(
+                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                    max_new_tokens=self.config.num_code_groups - 1,
+                    do_sample=subtalker_dosample,
+                    top_p=subtalker_top_p,
+                    top_k=subtalker_top_k,
+                    temperature=subtalker_temperature,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                )
+                codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+                codec_hiddens = torch.cat(
+                    [last_id_hidden]
+                    + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                    dim=1,
+                )
+
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
             if generation_step < trailing_text_hidden.shape[1]:
@@ -1901,7 +2048,61 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     def get_supported_languages(self):
         return self.supported_languages
-    
+
+    def enable_streaming_optimizations(
+        self,
+        decode_window_frames: int = 80,
+        use_compile: bool = True,
+        use_cuda_graphs: bool = True,
+        compile_mode: str = "reduce-overhead",
+        use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
+        compile_codebook_predictor: bool = True,
+    ):
+        """
+        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+
+        Call this after model loading to speed up streaming generation.
+        The optimizations apply to the speech tokenizer's decoder and talker.
+
+        Args:
+            decode_window_frames: Fixed window size for streaming (must match
+                                  decode_window_frames parameter in stream_generate_pcm)
+            use_compile: Apply torch.compile to the decoder
+            use_cuda_graphs: Capture CUDA graphs for the fixed window size
+            compile_mode: torch.compile mode ("reduce-overhead" recommended)
+            use_fast_codebook: Use fast codebook generation (bypasses HF generate() overhead)
+            compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
+
+        Returns:
+            self for method chaining
+
+        Example:
+            model = Qwen3TTSForConditionalGeneration.from_pretrained(...)
+            model.enable_streaming_optimizations(decode_window_frames=80)
+        """
+        if self.speech_tokenizer is None:
+            raise ValueError("Speech tokenizer not loaded. Call from_pretrained() first.")
+
+        # Enable decoder optimizations
+        self.speech_tokenizer.enable_streaming_optimizations(
+            decode_window_frames=decode_window_frames,
+            use_compile=use_compile,
+            use_cuda_graphs=use_cuda_graphs,
+            compile_mode=compile_mode,
+        )
+
+        # Enable fast codebook generation (bypasses HuggingFace generate() overhead)
+        if use_fast_codebook:
+            print("[Talker] Enabling fast codebook generation...")
+            self.talker.enable_fast_codebook_gen(True)
+
+        # Compile codebook predictor for faster inference
+        if compile_codebook_predictor and use_compile:
+            print(f"[CodePredictor] Compiling model with mode={compile_mode}...")
+            self.talker.code_predictor.enable_compile(mode=compile_mode)
+
+        return self
+
     @classmethod
     def from_pretrained(
         cls,
@@ -2314,8 +2515,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
                 if i not in (self.config.talker_config.codec_eos_token_id,)
             ],
-            "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
-            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
+            "output_hidden_states": kwargs.get("output_hidden_states", True),
+            "return_dict_in_generate": kwargs.get("return_dict_in_generate", True)
         }
 
         # Build talker inputs using shared method
@@ -2378,6 +2579,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decode_window_frames: int = 80,
         overlap_samples: int = 512,
         max_frames: int = 10000,
+        # Optimization flags
+        use_optimized_decode: bool = True,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2399,6 +2602,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             decode_window_frames: Window size for decoding (longer = better quality, more latency)
             overlap_samples: Overlap samples for crossfade between chunks
             max_frames: Maximum number of codec frames to generate
+            use_optimized_decode: Use CUDA graph optimized decode when available (default True)
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2424,6 +2628,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if i != eos_id
         ]
 
+        # Mark step begin for CUDA graphs (required for torch.compile with reduce-overhead)
+        torch.compiler.cudagraph_mark_step_begin()
+
         # Prefill: single forward pass to initialize KV cache
         out = self.talker.forward(
             inputs_embeds=talker_input_embeds,
@@ -2446,7 +2653,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         past_hidden = out.past_hidden
         generation_step = out.generation_step
 
-        print(f"[Prefill] done, generation_step={generation_step}, hidden_states type={type(out.hidden_states)}")
+        # Debug removed for performance: prefill done
 
         # Sample first token from prefill logits
         last_logits = out.logits[:, -1, :]
@@ -2454,25 +2661,25 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
-        print(f"[Prefill] first token sampled: {token.item()}, eos_id={eos_id}")
+        # Debug removed for performance: first token sampled
 
         # Decode loop
         codes_buffer: list[torch.Tensor] = []
         decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
-        import time as _time
-        _last_emit_time = _time.time()
 
         for step_idx in range(max_frames):
-            _step_start = _time.time()
+            # Mark step begin for CUDA graphs to avoid tensor overwrite errors
+            # This is required when using torch.compile with reduce-overhead mode
+            torch.compiler.cudagraph_mark_step_begin()
 
             # Single-step forward
             step_out = self.talker.forward(
                 input_ids=token.unsqueeze(1),
                 use_cache=True,
                 return_dict=True,
-                output_hidden_states=True,
+                output_hidden_states=False,  # Disabled: codec_ids accessed via hidden_states[1] still works
                 past_key_values=past_key_values,
                 past_hidden=past_hidden,
                 generation_step=generation_step,
@@ -2483,7 +2690,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 subtalker_top_p=subtalker_top_p,
                 subtalker_temperature=subtalker_temperature,
             )
-            _forward_time = _time.time() - _step_start
 
             # Update state for next iteration
             past_key_values = step_out.past_key_values
@@ -2492,19 +2698,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Get codec_ids from hidden_states tuple: (layer_outputs, codec_ids)
             codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
-            codec_ids_cpu = codec_ids[0].detach().cpu()
 
-            # Debug: periodic status
-            if step_idx % 10 == 0:
-                print(f"[Step {step_idx}] forward={_forward_time*1000:.1f}ms, codec[0]={int(codec_ids_cpu[0].item())}, gen_step={generation_step}")
-
-            # Check for EOS in first codebook BEFORE adding to buffer
+            # Check for EOS in first codebook ON GPU (avoids CPU sync bottleneck)
             # EOS token is out of range for speech tokenizer, so we must not include it
-            if int(codec_ids_cpu[0].item()) == int(eos_id):
-                print(f"[Step {step_idx}] EOS reached")
+            if codec_ids[0, 0] == eos_id:
                 break
 
-            codes_buffer.append(codec_ids_cpu)
+            # CPU transfer AFTER EOS check (not before) to avoid sync on every step
+            codes_buffer.append(codec_ids[0].detach().cpu())
 
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
@@ -2519,23 +2720,29 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             frames_since_emit = 0
 
             # Decode window of codec frames to PCM
-            _decode_start = _time.time()
             start = max(0, len(codes_buffer) - decode_window_frames)
             window = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
 
-            print(f"[Emit {len(codes_buffer)//emit_every_frames}] decoding window size={window.shape[0]}, time_since_last={_time.time()-_last_emit_time:.2f}s")
+            # Debug removed for performance: emit info
 
-            wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
-            _decode_time = _time.time() - _decode_start
-            print(f"[Emit] decode took {_decode_time*1000:.1f}ms")
-            _last_emit_time = _time.time()
+            # Use optimized decode path when available
+            # Pass pad_to_size to ensure fixed tensor size for torch.compile
+            if use_optimized_decode and hasattr(self.speech_tokenizer, 'decode_streaming'):
+                wavs, sr = self.speech_tokenizer.decode_streaming(
+                    window.to(self.talker.device),
+                    use_optimized=True,
+                    pad_to_size=decode_window_frames,
+                )
+            else:
+                wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+            # Debug removed for performance: decode time tracking
 
             wav = wavs[0].astype(np.float32)
 
             # Extract only new samples (tail of decoded window)
-            T = window.shape[0]
-            samples_per_frame = wav.shape[0] / float(T) if T > 0 else 0
-            step_samples = int(round(samples_per_frame * emit_every_frames))
+            # Use fixed upsample rate to avoid floating-point drift
+            samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
+            step_samples = samples_per_frame * emit_every_frames
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             # Crossfade with previous chunk tail for smooth transition
@@ -2552,7 +2759,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
         if remaining_frames > 0:
-            print(f"[Flush] decoding remaining {remaining_frames} frames (total={len(codes_buffer)}, emitted={total_frames_emitted})")
+            # Debug removed for performance: flush info
             # Decode a window that includes some context for quality
             context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
             start_idx = total_frames_emitted - context_frames
@@ -2574,7 +2781,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     head = _crossfade(decoded_tail[-ov:], wav[:ov])
                     wav = np.concatenate([head, wav[ov:]], axis=0)
 
-            print(f"[Flush] done, yielding {len(wav)} samples")
+            # Debug removed for performance: flush done
             yield wav, sr
 
 

@@ -25,61 +25,60 @@ This fork adds real streaming generation directly to the `qwen-tts` package.
 
 ## Usage
 
-```python
-import numpy as np
-import torch
-import soundfile as sf
-from qwen_tts import Qwen3TTSModel
+See examples/
+- [test_streaming_optimized.py](https://github.com/dffdeeq/Qwen3-TTS-streaming/blob/main/examples/test_streaming_optimized.py)
+- [test_optimized_no_streaming.py](https://github.com/dffdeeq/Qwen3-TTS-streaming/blob/main/examples/test_optimized_no_streaming.py)
 
-model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    device_map="cuda:0",
-    dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-)
+## Installation (python 3.12)
 
-# Create voice clone prompt (do once, reuse)
-voice_clone_prompt = model.create_voice_clone_prompt(
-    ref_audio="reference.wav",
-    ref_text="Your reference text here",
-)
+> Note: torch versions differ between Linux/Windows due to available flash_attn prebuilt wheels.
 
-# Streaming generation
-chunks = []
-for chunk, sr in model.stream_generate_voice_clone(
-    text="Your text to synthesize",
-    language="Russian",  # or any supported language
-    voice_clone_prompt=voice_clone_prompt,
-    emit_every_frames=8,
-    decode_window_frames=80,
-    overlap_samples=512,
-):
-    chunks.append(chunk)
-    # Here you can send chunk to audio player in real-time
+### 1. Install SOX
 
-# Or save complete audio
-final_audio = np.concatenate(chunks)
-sf.write("output.wav", final_audio, sr)
+**Linux:**
+```bash
+sudo apt install sox libsox-fmt-all
 ```
 
-See [`examples/test_streaming.py`](examples/test_streaming.py) for a complete benchmark script.
+**Windows:** 
+```bash
+# Download from https://sourceforge.net/projects/sox/ and add to PATH !!
+```
 
-## Installation
+### 2. Create environment
+```bash
+conda create -n qwen3-tts python=3.12 -y
+conda activate qwen3-tts
+```
 
+### 3. Install dependencies
+
+**Linux:**
+```bash
+pip install torch==2.9.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.6.8/flash_attn-2.8.3%2Bcu130torch2.9-cp312-cp312-linux_x86_64.whl
+```
+
+**Windows:**
+```bash
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-win_amd64.whl
+pip install -U "triton-windows<3.7"
+```
+
+### 4. Install package
 ```bash
 git clone https://github.com/dffdeeq/Qwen3-TTS-streaming.git
 cd Qwen3-TTS-streaming
 pip install -e .
-pip install flash-attn --no-build-isolation  # recommended
 ```
 
 ## Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `emit_every_frames` | 8 | Emit audio every N frames (~0.64s at 12Hz) |
+| `emit_every_frames` | 4 | Emit audio every N frames (~0.33s at 12Hz) |
 | `decode_window_frames` | 80 | Decoder context window |
-| `overlap_samples` | 512 | Crossfade overlap between chunks |
 
 ## Why This Exists
 

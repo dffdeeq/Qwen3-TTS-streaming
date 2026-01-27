@@ -118,7 +118,7 @@ def main():
     log_time(start, "Voice clone prompt created")
 
     # Test text
-    test_text = "Всем привет! Это тестовый текст для озвучки! Стриминг звучит нормально только через несколько секунд."
+    test_text = "Всем привет! Это тестовый текст для озвучки! Теперь стриминг звучит хорошо сразу."
 
     results = []
 
@@ -157,7 +157,7 @@ def main():
         label="streaming_baseline",
     )
     results.append(result)
-    sf.write("output_streaming_baseline.wav", result["audio"], result["sample_rate"])
+    sf.write("output_streaming_baseline-ref-fixed.wav", result["audio"], result["sample_rate"])
     rtf = result['total_time'] / result['audio_duration'] if result['audio_duration'] > 0 else 0
     print(f"First chunk: {result['first_chunk_time']:.2f}s, Total: {result['total_time']:.2f}s, Chunks: {result['chunk_count']}")
     print(f"Audio duration: {result['audio_duration']:.2f}s, Chunk duration: {result['avg_chunk_duration']*1000:.0f}ms, RTF: {rtf:.2f}")
@@ -197,7 +197,7 @@ def main():
         label="streaming_optimized",
     )
     results.append(result)
-    sf.write("output_streaming_optimized.wav", result["audio"], result["sample_rate"])
+    sf.write("output_streaming_optimized-ref-fixed.wav", result["audio"], result["sample_rate"])
     opt_rtf = result['total_time'] / result['audio_duration'] if result['audio_duration'] > 0 else 0
     print(f"First chunk: {result['first_chunk_time']:.2f}s, Total: {result['total_time']:.2f}s, Chunks: {result['chunk_count']}")
     print(f"Audio duration: {result['audio_duration']:.2f}s, Chunk duration: {result['avg_chunk_duration']*1000:.0f}ms, RTF: {opt_rtf:.2f}")

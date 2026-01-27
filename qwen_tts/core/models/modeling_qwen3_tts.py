@@ -101,6 +101,30 @@ def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
     return prev_tail[:n] * (1.0 - w) + new_head[:n] * w
 
 
+def _add_ref_code_context(
+    window_codes: torch.Tensor,
+    ref_code_context: Optional[torch.Tensor],
+    ref_code_frames: int,
+    decode_window_frames: int,
+) -> tuple[torch.Tensor, int]:
+    """Add ref_code as context prefix when window doesn't fill decode_window_frames.
+
+    Returns:
+        tuple: (window with prefix, number of ref_prefix_frames used)
+    """
+    if ref_code_context is None or window_codes.shape[0] >= decode_window_frames:
+        return window_codes, 0
+
+    available_space = decode_window_frames - window_codes.shape[0]
+    ref_prefix_frames = min(available_space, ref_code_frames)
+
+    if ref_prefix_frames > 0:
+        ref_prefix = ref_code_context[-ref_prefix_frames:]  # Use tail of ref_code
+        return torch.cat([ref_prefix, window_codes], dim=0), ref_prefix_frames
+
+    return window_codes, 0
+
+
 def download_weights_from_hf_specific(
     model_name_or_path: str,
     cache_dir: str | None,
@@ -2663,6 +2687,18 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             token = torch.argmax(last_logits, dim=-1)
         # Debug removed for performance: first token sampled
 
+        # Extract ref_code for decoder context (if in ICL mode)
+        # This provides stable context from the start, eliminating early voice artifacts
+        ref_code_context: Optional[torch.Tensor] = None
+        ref_code_frames: int = 0
+        if voice_clone_prompt is not None:
+            ref_code_list = voice_clone_prompt.get("ref_code", None)
+            icl_mode_list = voice_clone_prompt.get("icl_mode", None)
+            if ref_code_list is not None and icl_mode_list is not None:
+                if ref_code_list[0] is not None and icl_mode_list[0]:
+                    ref_code_context = ref_code_list[0].to(self.talker.device)
+                    ref_code_frames = ref_code_context.shape[0]
+
         # Decode loop
         codes_buffer: list[torch.Tensor] = []
         decoded_tail: Optional[np.ndarray] = None
@@ -2704,8 +2740,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if codec_ids[0, 0] == eos_id:
                 break
 
-            # CPU transfer AFTER EOS check (not before) to avoid sync on every step
-            codes_buffer.append(codec_ids[0].detach().cpu())
+            # Keep on GPU to avoid CPU<->GPU transfers during decode
+            codes_buffer.append(codec_ids[0].detach())
 
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
@@ -2721,9 +2757,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Decode window of codec frames to PCM
             start = max(0, len(codes_buffer) - decode_window_frames)
-            window = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
+            window_codes = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
 
-            # Debug removed for performance: emit info
+            # Add ref_code as context prefix for stable decoder context from the start
+            window, _ = _add_ref_code_context(
+                window_codes, ref_code_context, ref_code_frames, decode_window_frames
+            )
 
             # Use optimized decode path when available
             # Pass pad_to_size to ensure fixed tensor size for torch.compile
@@ -2759,19 +2798,24 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
         if remaining_frames > 0:
-            # Debug removed for performance: flush info
             # Decode a window that includes some context for quality
             context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
             start_idx = total_frames_emitted - context_frames
-            window = torch.stack(codes_buffer[start_idx:], dim=0)
+            window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
+
+            # Add ref_code as context prefix for stable decoder context
+            window, flush_ref_prefix_frames = _add_ref_code_context(
+                window_codes, ref_code_context, ref_code_frames, decode_window_frames
+            )
 
             wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
             wav = wavs[0].astype(np.float32)
 
-            # Extract only the new samples (skip the context portion)
-            if context_frames > 0:
+            # Extract only the new samples (skip ref_code and context portions)
+            skip_frames = flush_ref_prefix_frames + context_frames
+            if skip_frames > 0:
                 samples_per_frame = len(wav) / window.shape[0]
-                skip_samples = int(context_frames * samples_per_frame)
+                skip_samples = int(skip_frames * samples_per_frame)
                 wav = wav[skip_samples:]
 
             # Crossfade with previous tail

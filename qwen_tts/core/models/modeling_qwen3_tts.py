@@ -93,12 +93,19 @@ def _sample_next_token(
 
 
 def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
-    """Crossfade between end of previous chunk and start of new chunk."""
+    """Crossfade between end of previous chunk and start of new chunk using Hann window."""
     n = min(len(prev_tail), len(new_head))
     if n <= 0:
         return new_head
-    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    return prev_tail[:n] * (1.0 - w) + new_head[:n] * w
+    t = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    fade_in = 0.5 * (1 - np.cos(np.pi * t))
+    fade_out = 1 - fade_in
+    return prev_tail[:n] * fade_out + new_head[:n] * fade_in
+
+
+# Minimum samples for boundary blending (prevents clicks even with overlap_samples=0)
+# ~21ms at 24kHz, matches RMS check window for better coverage
+MIN_BLEND_SAMPLES = 512
 
 
 def _add_ref_code_context(
@@ -2806,13 +2813,32 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             # Crossfade with previous chunk tail for smooth transition
-            if decoded_tail is not None and overlap_samples > 0:
-                ov = min(overlap_samples, len(decoded_tail), len(chunk))
+            # Always blend boundaries to prevent clicks from sliding window re-decode artifacts
+            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            if decoded_tail is not None:
+                ov = min(blend_samples, len(decoded_tail), len(chunk))
                 if ov > 0:
                     head = _crossfade(decoded_tail[-ov:], chunk[:ov])
                     chunk = np.concatenate([head, chunk[ov:]], axis=0)
 
+            # Apply Hann fade-in to very first chunk to avoid pop at audio start
+            # Always apply fade-in on first chunk to prevent pop
+            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            if decoded_tail is None:
+                fade_len = min(blend_samples, len(chunk))
+                if fade_len > 0:
+                    t = np.arange(fade_len, dtype=np.float32) / max(fade_len - 1, 1)
+                    fade_in = 0.5 * (1 - np.cos(np.pi * t))
+                    chunk[:fade_len] *= fade_in
+
+            # Save FULL chunk for next crossfade reference
             decoded_tail = chunk.copy()
+
+            # Trim END of chunk - this region will be replaced by next chunk's crossfade
+            # Don't trim if chunk would become too small
+            if len(chunk) > blend_samples * 2:
+                chunk = chunk[:-blend_samples]
+
             total_frames_emitted = len(codes_buffer)  # Mark these frames as emitted
             yield chunk, sr
 
@@ -2840,11 +2866,20 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 wav = wav[skip_samples:]
 
             # Crossfade with previous tail
-            if decoded_tail is not None and overlap_samples > 0 and len(wav) > 0:
-                ov = min(overlap_samples, len(decoded_tail), len(wav))
+            # Always blend flush boundary
+            blend_samples = max(overlap_samples, MIN_BLEND_SAMPLES)
+            if decoded_tail is not None and len(wav) > 0:
+                ov = min(blend_samples, len(decoded_tail), len(wav))
                 if ov > 0:
                     head = _crossfade(decoded_tail[-ov:], wav[:ov])
                     wav = np.concatenate([head, wav[ov:]], axis=0)
+
+            # Apply fade-out at very end of audio to avoid pop on completion
+            if len(wav) > blend_samples:
+                fade_len = min(blend_samples, len(wav))
+                t = np.arange(fade_len, dtype=np.float32) / max(fade_len - 1, 1)
+                fade_out = 0.5 * (1 + np.cos(np.pi * t))  # Hann fade-out
+                wav[-fade_len:] *= fade_out
 
             # Debug removed for performance: flush done
             yield wav, sr

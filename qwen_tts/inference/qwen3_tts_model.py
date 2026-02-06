@@ -789,7 +789,8 @@ class Qwen3TTSModel:
         # Only keep params supported by stream_generate_pcm
         supported_params = {
             "do_sample", "top_k", "top_p", "temperature",
-            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
+            "repetition_penalty"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
 

@@ -2598,6 +2598,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_top_k: int = 50,
         subtalker_top_p: float = 1.0,
         subtalker_temperature: float = 0.9,
+        # Repetition penalty
+        repetition_penalty: float = 1.0,
         # Streaming control
         emit_every_frames: int = 8,
         decode_window_frames: int = 80,
@@ -2711,6 +2713,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
+        generated_token_ids: list[int] = []  # Track first-codebook tokens for repetition penalty
 
         for step_idx in range(max_frames):
             # Mark step begin for CUDA graphs to avoid tensor overwrite errors
@@ -2752,10 +2755,20 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
+
+            # Apply repetition penalty to previously generated tokens
+            if repetition_penalty != 1.0 and len(generated_token_ids) > 0:
+                prev_ids = torch.tensor(list(set(generated_token_ids)), device=step_logits.device)
+                scores = torch.gather(step_logits[0], 0, prev_ids)
+                scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
+                step_logits[0].scatter_(0, prev_ids, scores)
+
             if do_sample:
                 token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
             else:
                 token = torch.argmax(step_logits, dim=-1)
+
+            generated_token_ids.append(token.item())
 
             frames_since_emit += 1
 

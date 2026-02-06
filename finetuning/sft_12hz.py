@@ -92,11 +92,6 @@ def train():
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
-                for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
-
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
@@ -110,7 +105,7 @@ def train():
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
-                loss = outputs.loss + sub_talker_loss
+                loss = outputs.loss + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 

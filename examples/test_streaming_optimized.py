@@ -182,58 +182,64 @@ def main():
         compile_talker=True,
     )
 
-    # Warmup run (first run after compile is slower due to compilation)
-    print("\nWarmup run (first run after compile)...")
-    warmup_result = run_streaming_test(
-        model, "Тест один два три четыре пять.", "Russian", voice_clone_prompt,
-        emit_every_frames=EMIT_EVERY,
-        decode_window_frames=DECODE_WINDOW,
-        label="warmup",
-    )
-    warmup_rtf = warmup_result['total_time'] / warmup_result['audio_duration'] if warmup_result['audio_duration'] > 0 else 0
-    print(f"Warmup: First chunk: {warmup_result['first_chunk_time']:.2f}s, Total: {warmup_result['total_time']:.2f}s, Audio: {warmup_result['audio_duration']:.2f}s, RTF: {warmup_rtf:.2f}")
+    # Warmup runs (first runs after compile are slower due to compilation)
+    warmup_texts = [
+        "Тест один два три четыре пять.",
+        "Привет, как дела? Это второй прогрев системы.",
+        "Третий тестовый запуск для полного прогрева всех компонентов модели.",
+    ]
 
-    # Actual test run
-    print("\nOptimized test run...")
-    result = run_streaming_test(
-        model, test_text, "Russian", voice_clone_prompt,
-        emit_every_frames=EMIT_EVERY,
-        decode_window_frames=DECODE_WINDOW,
-        label="streaming_optimized",
-    )
-    results.append(result)
-    sf.write("output_streaming_optimized-ref-fixed.wav", result["audio"], result["sample_rate"])
-    opt_rtf = result['total_time'] / result['audio_duration'] if result['audio_duration'] > 0 else 0
-    print(f"First chunk: {result['first_chunk_time']:.2f}s, Total: {result['total_time']:.2f}s, Chunks: {result['chunk_count']}")
-    print(f"Audio duration: {result['audio_duration']:.2f}s, Chunk duration: {result['avg_chunk_duration']*1000:.0f}ms, RTF: {opt_rtf:.2f}")
+    print("\nWarmup runs (compilation happens here)...")
+    for i, warmup_text in enumerate(warmup_texts, 1):
+        warmup_result = run_streaming_test(
+            model, warmup_text, "Russian", voice_clone_prompt,
+            emit_every_frames=EMIT_EVERY,
+            decode_window_frames=DECODE_WINDOW,
+            label=f"warmup_{i}",
+        )
+        warmup_rtf = warmup_result['total_time'] / warmup_result['audio_duration'] if warmup_result['audio_duration'] > 0 else 0
+        print(f"  Warmup {i}: {warmup_result['total_time']:.2f}s, Audio: {warmup_result['audio_duration']:.2f}s, RTF: {warmup_rtf:.2f}")
 
-    # Second optimized run to show stable performance
-    print("\nSecond optimized run...")
-    result2 = run_streaming_test(
-        model, test_text, "Russian", voice_clone_prompt,
-        emit_every_frames=EMIT_EVERY,
-        decode_window_frames=DECODE_WINDOW,
-        label="streaming_optimized_2",
-    )
-    results.append(result2)
-    opt2_rtf = result2['total_time'] / result2['audio_duration'] if result2['audio_duration'] > 0 else 0
-    print(f"First chunk: {result2['first_chunk_time']:.2f}s, Total: {result2['total_time']:.2f}s, Audio: {result2['audio_duration']:.2f}s, RTF: {opt2_rtf:.2f}")
+    # Multiple optimized test runs
+    test_texts = [
+        ("Всем привет! Это тестовый текст для озвучки! Теперь стриминг звучит хорошо сразу.", "short"),
+        ("Это более длинный текст для тестирования производительности стриминга. Мы хотим убедиться, что система работает стабильно на разных длинах текста.", "medium"),
+        ("Короткий тест.", "tiny"),
+        ("Всем привет! Это тестовый текст для озвучки! Теперь стриминг звучит хорошо сразу.", "short_repeat"),
+    ]
+
+
+    print("\nOptimized test runs...")
+    for i, (text, text_label) in enumerate(test_texts, 1):
+        result = run_streaming_test(
+            model, text, "Russian", voice_clone_prompt,
+            emit_every_frames=EMIT_EVERY,
+            decode_window_frames=DECODE_WINDOW,
+            label=f"optimized_{text_label}",
+        )
+        results.append(result)
+        rtf = result['total_time'] / result['audio_duration'] if result['audio_duration'] > 0 else 0
+        print(f"  Run {i} ({text_label}): First chunk: {result['first_chunk_time']:.2f}s, Total: {result['total_time']:.2f}s, Audio: {result['audio_duration']:.2f}s, RTF: {rtf:.2f}")
+
+        if i == 1:
+            sf.write("output_streaming_optimized.wav", result["audio"], result["sample_rate"])
 
     # ============== Summary ==============
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
 
-    baseline_total = results[1]["total_time"]
-    baseline_first = results[1]["first_chunk_time"]
+    baseline_result = results[1]  # streaming_baseline
+    baseline_audio_dur = baseline_result.get("audio_duration", 0)
+    baseline_rtf = baseline_result["total_time"] / baseline_audio_dur if baseline_audio_dur > 0 else 0
 
-    print(f"\n{'Method':<25} {'1st Chunk':>10} {'Total':>8} {'Audio':>8} {'RTF':>6} {'Chunks':>7} {'Speedup':>8}")
+    print(f"\n{'Method':<25} {'1st Chunk':>10} {'Total':>8} {'Audio':>8} {'RTF':>6} {'Chunks':>7} {'RTF Speedup':>12}")
     print("-" * 80)
 
     # Standard generation
     std = results[0]
     std_rtf = std['total_time'] / std['audio_duration'] if std.get('audio_duration', 0) > 0 else 0
-    print(f"{'Standard (no streaming)':<25} {'N/A':>10} {std['total_time']:>7.2f}s {std.get('audio_duration', 0):>7.2f}s {std_rtf:>6.2f} {'N/A':>7} {'N/A':>8}")
+    print(f"{'Standard (no streaming)':<25} {'N/A':>10} {std['total_time']:>7.2f}s {std.get('audio_duration', 0):>7.2f}s {std_rtf:>6.2f} {'N/A':>7} {'N/A':>12}")
 
     for r in results[1:]:
         first = r.get("first_chunk_time", 0)
@@ -241,12 +247,21 @@ def main():
         audio_dur = r.get("audio_duration", 0)
         rtf = total / audio_dur if audio_dur > 0 else 0
         chunks = r.get("chunk_count", 0)
-        speedup_total = baseline_total / total if total > 0 else 0
-        print(f"{r['label']:<25} {first:>9.2f}s {total:>7.2f}s {audio_dur:>7.2f}s {rtf:>6.2f} {chunks:>7} {speedup_total:>7.2f}x")
+        speedup_rtf = baseline_rtf / rtf if rtf > 0 else 0
+        print(f"{r['label']:<25} {first:>9.2f}s {total:>7.2f}s {audio_dur:>7.2f}s {rtf:>6.2f} {chunks:>7} {speedup_rtf:>11.2f}x")
+
+    # Statistics for optimized runs (excluding baseline)
+    optimized_results = [r for r in results[2:] if r.get('audio_duration', 0) > 0]
+    if optimized_results:
+        avg_rtf = np.mean([r['total_time'] / r['audio_duration'] for r in optimized_results])
+        avg_first_chunk = np.mean([r['first_chunk_time'] for r in optimized_results])
+        print(f"\nOptimized runs statistics ({len(optimized_results)} runs):")
+        print(f"  Average RTF: {avg_rtf:.2f}")
+        print(f"  Average first chunk latency: {avg_first_chunk:.2f}s")
 
     # Chunk duration info
-    if results[1].get("avg_chunk_duration", 0) > 0:
-        print(f"\nChunk duration: ~{results[1]['avg_chunk_duration']*1000:.0f}ms ({results[1]['avg_chunk_samples']:.0f} samples @ {results[1]['sample_rate']}Hz)")
+    if baseline_result.get("avg_chunk_duration", 0) > 0:
+        print(f"\nChunk duration: ~{baseline_result['avg_chunk_duration']*1000:.0f}ms ({baseline_result['avg_chunk_samples']:.0f} samples @ {baseline_result['sample_rate']}Hz)")
 
     print(f"\n[{time.time() - total_start:.2f}s] TOTAL SCRIPT TIME")
 

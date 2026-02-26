@@ -674,7 +674,10 @@ class EuclideanCodebook(nn.Module):
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
-        quantized = F.embedding(codes, embedding)
+        # Clamp codes to valid range to prevent index out of bounds errors
+        # This can happen during streaming cancellation or numerical instability
+        codes_safe = codes.clamp(0, self.codebook_size - 1) 
+        quantized = F.embedding(codes_safe, embedding)
         return quantized
 
 
